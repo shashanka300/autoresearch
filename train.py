@@ -12,15 +12,79 @@ import gc
 import time
 from dataclasses import dataclass, asdict
 
+import platform
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kernels import get_kernel
-cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
+_compile_mode = os.environ.get("USE_TORCH_COMPILE", "auto").strip().lower()
+if _compile_mode in {"1", "true", "yes", "on"}:
+    ENABLE_TORCH_COMPILE = True
+elif _compile_mode in {"0", "false", "no", "off"}:
+    ENABLE_TORCH_COMPILE = False
+else:
+    # On Windows, torch.compile often needs Triton/Inductor support that may be missing.
+    ENABLE_TORCH_COMPILE = platform.system() != "Windows"
+
+def maybe_compile(fn):
+    if not ENABLE_TORCH_COMPILE:
+        return fn
+    return torch.compile(fn, dynamic=False, fullgraph=True)
+# Flash Attention 3 fallback for Windows/non-supported platforms
+def flash_attn_fallback(q, k, v, causal=True, window_size=None):
+    """Fallback attention using PyTorch's scaled_dot_product_attention."""
+    B, T, H, D = q.shape
+    # Transpose to (B, H, T, D) for scaled_dot_product_attention
+    q = q.transpose(1, 2)
+    k = k.transpose(1, 2)
+    v = v.transpose(1, 2)
+
+    # Handle GQA: repeat k,v if needed
+    if k.shape[2] != q.shape[2]:
+        n_rep = q.shape[1] // k.shape[1]
+        k = k.repeat(1, n_rep, 1, 1)
+        v = v.repeat(1, n_rep, 1, 1)
+
+    # Build attention mask
+    if causal or window_size is not None:
+        # Start with full causal mask
+        mask = torch.triu(torch.ones(T, T, device=q.device, dtype=torch.bool), diagonal=1)
+        # Apply sliding window if specified
+        if window_size is not None and window_size[0] < T:
+            window = window_size[0]
+            # Add mask for positions beyond window
+            for i in range(T):
+                mask[i, :max(0, i - window + 1)] = True
+        # Convert to additive mask (masked positions = -inf)
+        mask = mask.masked_fill(mask, float('-inf'))
+        mask = mask.masked_fill(~mask.bool(), 0.0)
+    else:
+        mask = None
+
+    # Use scaled_dot_product_attention
+    y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=causal and mask is None)
+    # Transpose back to (B, T, H, D)
+    y = y.transpose(1, 2).contiguous()
+    return y
+
+# Try to load Flash Attention 3, fall back to PyTorch implementation
+try:
+    from kernels import get_kernel
+    cap = torch.cuda.get_device_capability()
+    # varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
+    repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
+    fa3 = get_kernel(repo).flash_attn_interface
+    USE_FA3 = True
+    print("Using Flash Attention 3")
+except (ImportError, FileNotFoundError):
+    USE_FA3 = False
+    print("Using PyTorch attention fallback (Flash Attention 3 not available)")
+
+def flash_attn_func(q, k, v, causal=True, window_size=None):
+    if USE_FA3:
+        return fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
+    else:
+        return flash_attn_fallback(q, k, v, causal=causal, window_size=window_size)
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
@@ -89,7 +153,7 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        y = flash_attn_func(q, k, v, causal=True, window_size=window_size)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
@@ -301,7 +365,7 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
-@torch.compile(dynamic=False, fullgraph=True)
+@maybe_compile
 def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
     p.mul_(1 - lr_t * wd_t)
     exp_avg.lerp_(grad, 1 - beta1_t)
@@ -312,7 +376,7 @@ def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_
     step_size = lr_t / bias1
     p.add_(exp_avg / denom, alpha=-step_size)
 
-@torch.compile(dynamic=False, fullgraph=True)
+@maybe_compile
 def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
                     momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
     # Nesterov momentum
@@ -504,7 +568,11 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
-model = torch.compile(model, dynamic=False)
+if ENABLE_TORCH_COMPILE:
+    model = torch.compile(model, dynamic=False)
+    print("torch.compile enabled")
+else:
+    print("torch.compile disabled (set USE_TORCH_COMPILE=1 to force-enable)")
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
@@ -627,3 +695,4 @@ print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
+
