@@ -107,7 +107,9 @@ def norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
 
-def has_ve(layer_idx, n_layer):`r`n    """Ablation: disable value embeddings in all layers."""`r`n    return False
+def has_ve(layer_idx, n_layer):
+    """Returns True if layer should have Value Embedding (alternating, last always included)."""
+    return layer_idx % 2 == (n_layer - 1) % 2
 
 
 def apply_rotary_emb(x, cos, sin):
@@ -703,7 +705,6 @@ print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
-
 
 
 
