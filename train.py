@@ -517,7 +517,7 @@ WEIGHT_DECAY = 0.2      # cautious weight decay for Muon
 ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
 WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.3    # fraction of time budget for LR warmdown
-FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
+FINAL_LR_FRAC = 0.05     # final LR as fraction of initial
 
 # Model size
 DEPTH = 8               # number of transformer layers
@@ -705,6 +705,7 @@ print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
+
 
 
 
