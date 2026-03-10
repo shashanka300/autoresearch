@@ -39,8 +39,8 @@ def flash_attn_fallback(q, k, v, causal=True, window_size=None):
     k = k.transpose(1, 2)
     v = v.transpose(1, 2)
 
-    # Handle GQA: repeat k,v if needed
-    if k.shape[2] != q.shape[2]:
+    # Handle GQA: repeat k,v heads to match query head count
+    if k.shape[1] != q.shape[1]:
         n_rep = q.shape[1] // k.shape[1]
         k = k.repeat(1, n_rep, 1, 1)
         v = v.repeat(1, n_rep, 1, 1)
