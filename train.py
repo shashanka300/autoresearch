@@ -538,7 +538,7 @@ def build_model_config(depth):
     num_heads = model_dim // HEAD_DIM
     return GPTConfig(
         sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
-        n_layer=depth, n_head=num_heads, n_kv_head=max(1, num_heads // 2), n_embd=model_dim,
+        n_layer=depth, n_head=num_heads, n_kv_head=max(1, num_heads // 4), n_embd=model_dim,
         window_pattern=WINDOW_PATTERN,
     )
 
@@ -698,6 +698,7 @@ print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
+
 
 
 
