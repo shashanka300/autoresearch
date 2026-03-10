@@ -116,8 +116,15 @@ def apply_rotary_emb(x, cos, sin):
     assert x.ndim == 4
     d = x.shape[3] // 2
     x1, x2 = x[..., :d], x[..., d:]
-    y1 = x1 * cos + x2 * sin
-    y2 = x1 * (-sin) + x2 * cos
+    # Partial RoPE: rotate only first 50% of channels, keep the rest unchanged.
+    rot_pairs = d // 2
+    cos_r, sin_r = cos[..., :rot_pairs], sin[..., :rot_pairs]
+    x1_rot, x1_passthrough = x1[..., :rot_pairs], x1[..., rot_pairs:]
+    x2_rot, x2_passthrough = x2[..., :rot_pairs], x2[..., rot_pairs:]
+    y1_rot = x1_rot * cos_r + x2_rot * sin_r
+    y2_rot = x1_rot * (-sin_r) + x2_rot * cos_r
+    y1 = torch.cat([y1_rot, x1_passthrough], dim=3)
+    y2 = torch.cat([y2_rot, x2_passthrough], dim=3)
     return torch.cat([y1, y2], 3)
 
 
