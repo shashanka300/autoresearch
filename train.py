@@ -169,7 +169,7 @@ class MLP(nn.Module):
         self.c_proj = nn.Linear(hidden, config.n_embd, bias=False)
 
     def forward(self, x):
-        gate = F.silu(self.c_gate(x))
+        gate = F.gelu(self.c_gate(x))
         up = self.c_up(x)
         return self.c_proj(gate * up)
 
@@ -698,6 +698,7 @@ print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
+
 
 
 
