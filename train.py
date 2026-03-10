@@ -107,9 +107,7 @@ def norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
 
-def has_ve(layer_idx, n_layer):
-    """Ablation: disable value embeddings in all layers."""
-    return False
+def has_ve(layer_idx, n_layer):`r`n    """Ablation: disable value embeddings in all layers."""`r`n    return False
 
 
 def apply_rotary_emb(x, cos, sin):
