@@ -12,20 +12,19 @@ Status: keep
 - DEVICE_BATCH_SIZE = 32
 - WARMDOWN_RATIO = 0.3
 - WINDOW_PATTERN = "SSSL"
-- MLP = parameter-matched SwiGLU
-- GQA = n_kv_head = n_head // 4 (4:1)
-- RoPE = Partial RoPE (50% rotated channels)
+- MLP = SwiGLU
+- GQA = 4:1
+- Partial RoPE = yes
 - RoPE base = 50000
-- Value embeddings = ON (alternating layers)
+- Value embeddings = on
 - Residual scalars = learned
-- torch.compile = OFF on Windows auto mode
+- QKV bias = off
+- Optimizer vector-param fix = off
 
-## Key discarded alternatives vs chosen config
-- GeGLU gate: worse val_bpb (0.001456)
-- GQA 2:1: worse val_bpb (0.001434)
-- Value embeddings OFF: much worse (0.001536)
-- Fixed residual scalars (1,0): worse (0.001527)
+## Active Branch Note
+- Current HEAD includes an optimizer safety fix for vector params (`optimizer_vector_fix=on`).
+- This safety fix did not improve quality by itself (`a18e376`: 0.001383), but is safe to keep.
 
-## Where to see all runs
-- Simple log: results.tsv
-- Detailed log with config columns: detailed_results.tsv
+## Logs
+- results.tsv (compact)
+- detailed_results.tsv (full config per run)
