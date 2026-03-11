@@ -12,15 +12,79 @@ import gc
 import time
 from dataclasses import dataclass, asdict
 
+import platform
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kernels import get_kernel
-cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
+_compile_mode = os.environ.get("USE_TORCH_COMPILE", "auto").strip().lower()
+if _compile_mode in {"1", "true", "yes", "on"}:
+    ENABLE_TORCH_COMPILE = True
+elif _compile_mode in {"0", "false", "no", "off"}:
+    ENABLE_TORCH_COMPILE = False
+else:
+    # On Windows, torch.compile often needs Triton/Inductor support that may be missing.
+    ENABLE_TORCH_COMPILE = platform.system() != "Windows"
+
+def maybe_compile(fn):
+    if not ENABLE_TORCH_COMPILE:
+        return fn
+    return torch.compile(fn, dynamic=False, fullgraph=True)
+# Flash Attention 3 fallback for Windows/non-supported platforms
+def flash_attn_fallback(q, k, v, causal=True, window_size=None):
+    """Fallback attention using PyTorch's scaled_dot_product_attention."""
+    B, T, H, D = q.shape
+    # Transpose to (B, H, T, D) for scaled_dot_product_attention
+    q = q.transpose(1, 2)
+    k = k.transpose(1, 2)
+    v = v.transpose(1, 2)
+
+    # Handle GQA: repeat k,v heads to match query head count
+    if k.shape[1] != q.shape[1]:
+        n_rep = q.shape[1] // k.shape[1]
+        k = k.repeat(1, n_rep, 1, 1)
+        v = v.repeat(1, n_rep, 1, 1)
+
+    # Build attention mask
+    if causal or window_size is not None:
+        # Start with full causal mask
+        mask = torch.triu(torch.ones(T, T, device=q.device, dtype=torch.bool), diagonal=1)
+        # Apply sliding window if specified
+        if window_size is not None and window_size[0] < T:
+            window = window_size[0]
+            # Add mask for positions beyond window
+            for i in range(T):
+                mask[i, :max(0, i - window + 1)] = True
+        # Convert to additive mask (masked positions = -inf)
+        mask = mask.masked_fill(mask, float('-inf'))
+        mask = mask.masked_fill(~mask.bool(), 0.0)
+    else:
+        mask = None
+
+    # Use scaled_dot_product_attention
+    y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=causal and mask is None)
+    # Transpose back to (B, T, H, D)
+    y = y.transpose(1, 2).contiguous()
+    return y
+
+# Try to load Flash Attention 3, fall back to PyTorch implementation
+try:
+    from kernels import get_kernel
+    cap = torch.cuda.get_device_capability()
+    # varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
+    repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
+    fa3 = get_kernel(repo).flash_attn_interface
+    USE_FA3 = True
+    print("Using Flash Attention 3")
+except (ImportError, FileNotFoundError):
+    USE_FA3 = False
+    print("Using PyTorch attention fallback (Flash Attention 3 not available)")
+
+def flash_attn_func(q, k, v, causal=True, window_size=None):
+    if USE_FA3:
+        return fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
+    else:
+        return flash_attn_fallback(q, k, v, causal=causal, window_size=window_size)
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
@@ -52,8 +116,15 @@ def apply_rotary_emb(x, cos, sin):
     assert x.ndim == 4
     d = x.shape[3] // 2
     x1, x2 = x[..., :d], x[..., d:]
-    y1 = x1 * cos + x2 * sin
-    y2 = x1 * (-sin) + x2 * cos
+    # Partial RoPE: rotate only first 50% of channels, keep the rest unchanged.
+    rot_pairs = d // 2
+    cos_r, sin_r = cos[..., :rot_pairs], sin[..., :rot_pairs]
+    x1_rot, x1_passthrough = x1[..., :rot_pairs], x1[..., rot_pairs:]
+    x2_rot, x2_passthrough = x2[..., :rot_pairs], x2[..., rot_pairs:]
+    y1_rot = x1_rot * cos_r + x2_rot * sin_r
+    y2_rot = x1_rot * (-sin_r) + x2_rot * cos_r
+    y1 = torch.cat([y1_rot, x1_passthrough], dim=3)
+    y2 = torch.cat([y2_rot, x2_passthrough], dim=3)
     return torch.cat([y1, y2], 3)
 
 
@@ -89,7 +160,7 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        y = flash_attn_func(q, k, v, causal=True, window_size=window_size)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
@@ -98,14 +169,16 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        # Parameter-matched SwiGLU hidden size (~8/3 * d) vs ReGLU 4*d baseline
+        hidden = (8 * config.n_embd) // 3
+        self.c_gate = nn.Linear(config.n_embd, hidden, bias=False)
+        self.c_up = nn.Linear(config.n_embd, hidden, bias=False)
+        self.c_proj = nn.Linear(hidden, config.n_embd, bias=False)
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = F.relu(x).square()
-        x = self.c_proj(x)
-        return x
+        gate = F.silu(self.c_gate(x))
+        up = self.c_up(x)
+        return self.c_proj(gate * up)
 
 
 class Block(nn.Module):
@@ -158,7 +231,8 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+            torch.nn.init.uniform_(block.mlp.c_gate.weight, -s, s)
+            torch.nn.init.uniform_(block.mlp.c_up.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)
@@ -179,7 +253,7 @@ class GPT(nn.Module):
         for ve in self.value_embeds.values():
             ve.to(dtype=torch.bfloat16)
 
-    def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
+    def _precompute_rotary_embeddings(self, seq_len, head_dim, base=50000, device=None):
         if device is None:
             device = self.transformer.wte.weight.device
         channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
@@ -235,14 +309,17 @@ class GPT(nn.Module):
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
                         weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
         model_dim = self.config.n_embd
-        matrix_params = list(self.transformer.h.parameters())
+        block_params = list(self.transformer.h.parameters())
+        matrix_params = [p for p in block_params if p.ndim >= 2]
+        vector_params = [p for p in block_params if p.ndim < 2]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
-            len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params))
+        assert len(list(self.parameters())) == (len(matrix_params) + len(vector_params) +
+            len(embedding_params) + len(lm_head_params) + len(value_embeds_params) +
+            len(resid_params) + len(x0_params))
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
@@ -250,6 +327,7 @@ class GPT(nn.Module):
             dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=vector_params, lr=matrix_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
         ]
@@ -301,7 +379,7 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
-@torch.compile(dynamic=False, fullgraph=True)
+@maybe_compile
 def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
     p.mul_(1 - lr_t * wd_t)
     exp_avg.lerp_(grad, 1 - beta1_t)
@@ -312,7 +390,7 @@ def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_
     step_size = lr_t / bias1
     p.add_(exp_avg / denom, alpha=-step_size)
 
-@torch.compile(dynamic=False, fullgraph=True)
+@maybe_compile
 def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
                     momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
     # Nesterov momentum
@@ -442,12 +520,12 @@ SCALAR_LR = 0.5         # learning rate for per-layer scalars (Adam)
 WEIGHT_DECAY = 0.2      # cautious weight decay for Muon
 ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
 WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
-WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
+WARMDOWN_RATIO = 0.3    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
 DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
+DEVICE_BATCH_SIZE = 32  # per-device batch size (reduce if OOM)
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -471,7 +549,7 @@ def build_model_config(depth):
     num_heads = model_dim // HEAD_DIM
     return GPTConfig(
         sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
-        n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
+        n_layer=depth, n_head=num_heads, n_kv_head=max(1, num_heads // 4), n_embd=model_dim,
         window_pattern=WINDOW_PATTERN,
     )
 
@@ -504,7 +582,11 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
-model = torch.compile(model, dynamic=False)
+if ENABLE_TORCH_COMPILE:
+    model = torch.compile(model, dynamic=False)
+    print("torch.compile enabled")
+else:
+    print("torch.compile disabled (set USE_TORCH_COMPILE=1 to force-enable)")
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
@@ -627,3 +709,10 @@ print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
+
+
+
+
+
+
+
